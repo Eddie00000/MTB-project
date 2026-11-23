@@ -19,3 +19,4 @@ Commandes série (terminées par Entrée) : `ARM`, `RUN`, `STOP`, `CLEAR`, `STAT
 - La protection matérielle (comparateurs, verrou 74HC74, STOP) reste la sécurité principale.
 - Le firmware démarre toujours avec EN = 0 et PWM = 0.
 - Ne jamais brancher J2 avec le fil +5V_USB -> +5V encore en place.
+# MTB-project
