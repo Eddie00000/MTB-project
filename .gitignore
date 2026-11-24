@@ -16,3 +16,8 @@ _autosave-*
 # Divers
 *.log
 __pycache__/
+
+# Mesures python
+essai_mtb_
+*.csv
+pc/.venv/
