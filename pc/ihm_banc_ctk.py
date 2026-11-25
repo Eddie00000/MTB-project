@@ -7,6 +7,13 @@ La logique est la même que dans ihm_banc.py :
   - les mesures sont tracées en direct et enregistrées dans un fichier CSV
 Seul l'habillage change (CustomTkinter à la place de Tkinter).
 
+Deux onglets :
+  - Mesures : valeurs instantanées et courbes
+  - PWM     : choix de la fréquence (liste de 8 valeurs), du rapport cyclique,
+              et tracé du signal PWM théorique (reconstruit, ce n'est pas une mesure)
+Les commandes envoyées à la carte sont celles du firmware : f<numéro>, d<pourcentage>, p
+(chacune terminée par Entrée), le PWM ne sort qu'en RUN.
+
 Dépendances :  pip install -r requirements.txt
 Lancer      :  python ihm_banc_ctk.py
 (fermer d'abord le moniteur série de PlatformIO : un seul programme peut utiliser le port)
@@ -32,6 +39,13 @@ BAUD = 115200
 PERIODE_MS = 200        # une mesure demandée toutes les 200 ms (doit rester sous 1000 ms)
 FENETRE_S = 60          # durée affichée sur les courbes
 NB_POINTS = int(FENETRE_S * 1000 / PERIODE_MS)
+
+# PWM : la liste doit être la même que FREQUENCES_HZ dans le firmware (numéro 1 à 8)
+FREQUENCES = ["1 kHz", "2 kHz", "5 kHz", "10 kHz", "20 kHz", "50 kHz", "100 kHz", "200 kHz"]
+FREQUENCE_DEFAUT = 5            # numéro de la fréquence au démarrage du firmware (20 kHz)
+RAPPORT_MAX_PCT = 90            # même valeur que RAPPORT_MAX_PCT dans le firmware
+
+NB_PERIODES_PWM = 3          # nombre de périodes tracées dans l'onglet PWM
 
 # Couleurs (thème sombre)
 FOND_COURBES = "#242424"
@@ -85,6 +99,8 @@ class IHM:
         self.csv_w = None
         self.t0 = time.time()
         self.nouveau = False
+        self.pwm_autorise = False          # vrai quand la carte est en RUN sans défaut
+        self.pwm_freq_hz = 20000           # dernière fréquence annoncée par la carte
 
         self.temps = deque(maxlen=NB_POINTS)
         self.h_i = deque(maxlen=NB_POINTS)
@@ -133,27 +149,102 @@ class IHM:
         zone = ctk.CTkFrame(self.root, fg_color="transparent")
         zone.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         zone.grid_columnconfigure(0, weight=1)
-        zone.grid_rowconfigure(2, weight=1)          # les courbes prennent la place libre
+        zone.grid_rowconfigure(1, weight=1)          # les onglets prennent la place libre
 
-        # Ligne 0 : les 4 valeurs instantanées
-        cartes = ctk.CTkFrame(zone, fg_color="transparent")
+        # Ligne 0 : l'état de la carte (toujours visible)
+        self.lbl_etat = ctk.CTkLabel(zone, text="Non connecté", font=ctk.CTkFont(size=16, weight="bold"))
+        self.lbl_etat.grid(row=0, column=0, pady=(0, 8))
+
+        # Ligne 1 : les onglets
+        self.onglets = ctk.CTkTabview(zone)
+        self.onglets.grid(row=1, column=0, sticky="nsew")
+        self.construire_onglet_mesures(self.onglets.add("Mesures"))
+        self.construire_onglet_pwm(self.onglets.add("PWM"))
+
+        # Ligne 2 : le journal des messages (toujours visible)
+        self.console = ctk.CTkTextbox(zone, height=110, font=ctk.CTkFont(family="Consolas", size=12))
+        self.console.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.console.configure(state="disabled")
+
+    def construire_onglet_mesures(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)        # les courbes prennent la place libre
+
+        # Les 4 valeurs instantanées
+        cartes = ctk.CTkFrame(parent, fg_color="transparent")
         cartes.grid(row=0, column=0, sticky="ew")
         self.val_i = self.creer_carte(cartes, 0, "Courant", "A")
         self.val_vbus = self.creer_carte(cartes, 1, "VBUS", "V")
         self.val_vdrv = self.creer_carte(cartes, 2, "VDRV", "V")
         self.val_temp = self.creer_carte(cartes, 3, "Température", "°C")
 
-        # Ligne 1 : l'état de la carte
-        self.lbl_etat = ctk.CTkLabel(zone, text="Non connecté", font=ctk.CTkFont(size=16, weight="bold"))
-        self.lbl_etat.grid(row=1, column=0, pady=8)
+        # Les courbes
+        self.construire_courbes(parent)
 
-        # Ligne 2 : les courbes
-        self.construire_courbes(zone)
+    def construire_onglet_pwm(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(6, weight=1)        # le graphique prend la place libre
 
-        # Ligne 3 : le journal des messages
-        self.console = ctk.CTkTextbox(zone, height=110, font=ctk.CTkFont(family="Consolas", size=12))
-        self.console.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.console.configure(state="disabled")
+        ctk.CTkLabel(parent, text="Commande du PWM (Timer1)",
+                     font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, pady=(8, 0))
+        ctk.CTkLabel(parent, text="Le PWM ne sort qu'en RUN. Changer la fréquence remet le rapport à 0 %.",
+                     text_color="gray").grid(row=1, column=0, pady=(0, 6))
+
+        # --- Fréquence : on choisit dans la liste, c'est envoyé tout de suite
+        bloc_f = ctk.CTkFrame(parent)
+        bloc_f.grid(row=2, column=0, padx=30, pady=4, sticky="ew")
+        ctk.CTkLabel(bloc_f, text="Fréquence", width=140, anchor="w").pack(side="left", padx=15, pady=8)
+        self.libelles_freq = [f"{i + 1} : {f}" for i, f in enumerate(FREQUENCES)]
+        self.menu_freq = ctk.CTkOptionMenu(bloc_f, values=self.libelles_freq, width=160,
+                                           command=self.changer_frequence, state="disabled")
+        self.menu_freq.set(self.libelles_freq[FREQUENCE_DEFAUT - 1])
+        self.menu_freq.pack(side="left", padx=10)
+
+        # --- Rapport cyclique : on règle le curseur, puis on clique sur Appliquer
+        bloc_d = ctk.CTkFrame(parent)
+        bloc_d.grid(row=3, column=0, padx=30, pady=4, sticky="ew")
+        bloc_d.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(bloc_d, text="Rapport cyclique", width=140, anchor="w").grid(row=0, column=0, padx=15, pady=8)
+        self.slider = ctk.CTkSlider(bloc_d, from_=0, to=RAPPORT_MAX_PCT, number_of_steps=RAPPORT_MAX_PCT,
+                                    command=self.slider_bouge, state="disabled")
+        self.slider.set(0)
+        self.slider.grid(row=0, column=1, padx=10, sticky="ew")
+        self.lbl_rapport = ctk.CTkLabel(bloc_d, text="0 %", width=60, font=ctk.CTkFont(size=16, weight="bold"))
+        self.lbl_rapport.grid(row=0, column=2, padx=15)
+
+        # --- Boutons
+        boutons = ctk.CTkFrame(parent, fg_color="transparent")
+        boutons.grid(row=4, column=0, pady=6)
+        self.btn_appliquer = ctk.CTkButton(boutons, text="Appliquer le rapport", width=170,
+                                           state="disabled", command=self.appliquer_rapport)
+        self.btn_appliquer.pack(side="left", padx=8)
+        self.btn_zero = ctk.CTkButton(boutons, text="PWM à 0 %", width=120, fg_color=ROUGE,
+                                      state="disabled", command=self.rapport_zero)
+        self.btn_zero.pack(side="left", padx=8)
+
+        # --- Dernier message de la carte au sujet du PWM
+        self.lbl_retour_pwm = ctk.CTkLabel(parent, text="Retour de la carte : ---", text_color="gray")
+        self.lbl_retour_pwm.grid(row=5, column=0, pady=(4, 0))
+
+        # --- Graphique du signal PWM théorique
+        fig = Figure(figsize=(8, 2.2), dpi=100, facecolor=FOND_COURBES)
+        self.ax_pwm = fig.subplots()
+        (self.ligne_pwm,) = self.ax_pwm.plot([], [], color="#f2c94c", linewidth=2)
+        self.ax_pwm.set_facecolor(FOND_COURBES)
+        self.ax_pwm.tick_params(colors=TEXTE_COURBES)
+        self.ax_pwm.xaxis.label.set_color(TEXTE_COURBES)
+        self.ax_pwm.yaxis.label.set_color(TEXTE_COURBES)
+        self.ax_pwm.title.set_color(TEXTE_COURBES)
+        self.ax_pwm.grid(True, linestyle="--", alpha=0.3)
+        for bord in self.ax_pwm.spines.values():
+            bord.set_color("#555555")
+        fig.subplots_adjust(left=0.08, right=0.98, top=0.82, bottom=0.25)
+        self.canvas_pwm = FigureCanvasTkAgg(fig, master=parent)
+        self.canvas_pwm.get_tk_widget().grid(row=6, column=0, sticky="nsew", padx=10, pady=(4, 0))
+        ctk.CTkLabel(parent, text="Signal théorique reconstruit à partir des réglages (ce n'est pas une mesure). "
+                                  "Le vrai signal se mesure à l'oscilloscope sur PB1.",
+                     text_color="gray", font=ctk.CTkFont(size=11)).grid(row=7, column=0, pady=(0, 2))
+        self.tracer_pwm(self.pwm_freq_hz, 0)
 
     def creer_carte(self, parent, colonne, titre, unite):
         """Une petite carte avec un titre et une valeur. Renvoie le label de la valeur."""
@@ -188,7 +279,7 @@ class IHM:
                 bord.set_color("#555555")
         fig.tight_layout()
         self.canvas = FigureCanvasTkAgg(fig, master=parent)
-        self.canvas.get_tk_widget().grid(row=2, column=0, sticky="nsew")
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
 
     # ------------------------------------------------------------
     # Connexion
@@ -229,6 +320,7 @@ class IHM:
         self.btn_conn.configure(text="Déconnecter")
         for b in self.boutons:
             b.configure(state="normal")
+        self.menu_freq.configure(state="normal")
         self.lbl_etat.configure(text="Connecté, démarrage...", text_color="white")
         self.log(f"Connecté sur {ser.port} - enregistrement dans {nom}")
         self.root.after(1500, self._activer_interrogation)   # laisse la carte démarrer
@@ -236,6 +328,7 @@ class IHM:
     def _activer_interrogation(self):
         if self.running:
             self.pret = True
+            self.envoyer("p")          # demande l'état du PWM pour mettre le menu à jour
 
     def deconnecter(self):
         if self.ser and self.ser.is_open:
@@ -259,6 +352,8 @@ class IHM:
         self.btn_conn.configure(text="Connecter")
         for b in self.boutons:
             b.configure(state="disabled")
+        self.menu_freq.configure(state="disabled")
+        self.autoriser_pwm(False)
         self.lbl_etat.configure(text="Non connecté", text_color="white")
 
     def _perte(self, message):
@@ -310,6 +405,8 @@ class IHM:
                 self._nouvelle_mesure(m)
             else:
                 self.log(contenu)
+                if contenu.startswith("PWM :"):
+                    self.lire_retour_pwm(contenu)
 
     def _nouvelle_mesure(self, m):
         t = time.time() - self.t0
@@ -334,6 +431,11 @@ class IHM:
         else:
             self.lbl_etat.configure(text="Repos - EN coupé", text_color="white")
 
+        # Le réglage du rapport cyclique n'est possible qu'en RUN sans défaut
+        actif = bool(m["en"]) and not m["defaut"]
+        if actif != self.pwm_autorise:
+            self.autoriser_pwm(actif)
+
         # Enregistrement CSV
         if self.csv_w:
             self.csv_w.writerow([fr(f"{t:.2f}"), fr(m["t_carte_s"]), fr(m["i_a"]), fr(m["vbus_v"]),
@@ -351,6 +453,90 @@ class IHM:
             ax.relim()
             ax.autoscale_view(scalex=False)
         self.canvas.draw_idle()
+
+    # ------------------------------------------------------------
+    # Onglet PWM
+    # ------------------------------------------------------------
+    def changer_frequence(self, choix):
+        """Appelée quand on choisit une fréquence dans le menu : '5 : 20 kHz' -> envoie 'f5'."""
+        numero = choix.split(" ")[0]
+        self.envoyer(f"f{numero}\n")
+        self.slider.set(0)                  # le firmware remet le rapport à 0 %
+        self.slider_bouge(0)
+
+    def slider_bouge(self, valeur):
+        self.lbl_rapport.configure(text=f"{int(valeur)} %")
+
+    def appliquer_rapport(self):
+        pourcent = int(self.slider.get())
+        self.envoyer(f"d{pourcent}\n")
+
+    def rapport_zero(self):
+        self.slider.set(0)
+        self.slider_bouge(0)
+        self.envoyer("d0\n")
+
+    def autoriser_pwm(self, actif):
+        """Active ou désactive les commandes du rapport cyclique (seulement en RUN)."""
+        self.pwm_autorise = actif
+        etat = "normal" if actif else "disabled"
+        self.slider.configure(state=etat)
+        self.btn_appliquer.configure(state=etat)
+        self.btn_zero.configure(state=etat)
+        if not actif:
+            self.slider.set(0)              # la carte remet le rapport à 0 % quand EN est coupé
+            self.slider_bouge(0)
+            self.tracer_pwm(self.pwm_freq_hz, 0)
+
+    def lire_retour_pwm(self, ligne):
+        """Ligne de la carte : 'PWM : f3 = 5000 Hz | rapport ...' -> affichée et menu mis à jour."""
+        self.lbl_retour_pwm.configure(text="Retour de la carte : " + ligne)
+        try:
+            numero = int(ligne.split("PWM : f")[1].split(" ")[0])
+            frequence = float(ligne.split("= ")[1].split(" Hz")[0])
+            if "rapport reel" in ligne:
+                rapport = float(ligne.split("rapport reel ")[1].split(" %")[0])
+            else:
+                rapport = 0.0                    # "rapport 0 % (sortie coupee)"
+        except (IndexError, ValueError):
+            return
+        if 1 <= numero <= len(FREQUENCES):
+            self.menu_freq.set(self.libelles_freq[numero - 1])
+        self.pwm_freq_hz = frequence
+        self.tracer_pwm(frequence, rapport)
+
+    def tracer_pwm(self, frequence_hz, rapport_pct):
+        """Trace NB_PERIODES_PWM périodes du signal carré 0 - 5 V (au début de chaque période : niveau haut)."""
+        periode = 1.0 / frequence_hz
+        # Unité de l'axe du temps : ms si la période est >= 1 ms, sinon µs
+        if periode >= 1e-3:
+            unite, facteur = "ms", 1e3
+        else:
+            unite, facteur = "µs", 1e6
+        periode_u = periode * facteur
+
+        x = []
+        y = []
+        for k in range(NB_PERIODES_PWM):
+            debut = k * periode_u
+            if rapport_pct <= 0:
+                x += [debut, debut + periode_u]                  # sortie coupée : ligne à 0 V
+                y += [0, 0]
+            else:
+                fin_haut = debut + periode_u * rapport_pct / 100
+                x += [debut, debut, fin_haut, fin_haut, debut + periode_u]
+                y += [0, 5, 5, 0, 0]
+        self.ligne_pwm.set_data(x, y)
+        self.ax_pwm.set_xlim(0, NB_PERIODES_PWM * periode_u)
+        self.ax_pwm.set_ylim(-0.6, 6)
+        self.ax_pwm.set_xlabel(f"Temps ({unite})")
+        self.ax_pwm.set_ylabel("PB1 (V)")
+        if frequence_hz >= 1000:
+            texte_f = f"{frequence_hz / 1000:g} kHz"
+        else:
+            texte_f = f"{frequence_hz:g} Hz"
+        self.ax_pwm.set_title(f"{texte_f} - rapport cyclique {rapport_pct:.1f} %", fontsize=10)
+        self.canvas_pwm.draw_idle()
 
     def log(self, texte):
         self.console.configure(state="normal")
